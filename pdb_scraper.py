@@ -24,6 +24,12 @@ The insider root shards files into sub-directories named after
 Symbol-server binary URL (built from fileInfo.timestamp + fileInfo.virtualSize):
     https://msdl.microsoft.com/download/symbols/<name>/<TimeDateStamp:08X><SizeOfImage:X>/<name>
 
+When virtualSize is missing (delta-indexed entries), Winbindex's Download button
+generates several SizeOfImage candidate URLs from delta metadata (size,
+lastSectionPointerToRawData, lastSectionVirtualAddress) using the same algorithm
+as DeltaDownloader / winbindex.js onMultiDownloadClick. This script reproduces
+that list and HEAD-probes candidates until one exists on the symbol server.
+
 PDB URL (built from the PE debug directory, via pyPDBdownload):
     https://msdl.microsoft.com/download/symbols/<pdb>/<GUID><age>/<pdb>
 """
@@ -406,6 +412,64 @@ def build_binary_url(filename, timestamp, virtual_size):
     return MSDL % (filename, seg, filename)
 
 
+PAGE_SIZE = 0x1000
+
+
+def mapped_size(size):
+    """Round `size` up to the next page boundary (DeltaDownloader GetMappedSize)."""
+    page_mask = PAGE_SIZE - 1
+    page = size & ~page_mask
+    if page == size:
+        return page
+    return page + PAGE_SIZE
+
+
+def delta_virtual_size_candidates(file_size, last_section_ptr, last_section_va):
+    """Candidate SizeOfImage values from delta metadata (high -> low).
+
+    Mirrors winbindex.js onMultiDownloadClick / DeltaDownloader Program.cs.
+    """
+    last_section_and_signature_size = file_size - last_section_ptr
+    size_of_image = mapped_size(last_section_va + last_section_and_signature_size)
+    lowest_size_of_image = last_section_va + PAGE_SIZE
+    sizes = []
+    size = size_of_image
+    while size >= lowest_size_of_image:
+        sizes.append(size)
+        size -= PAGE_SIZE
+    return sizes
+
+
+def resolve_binary_url(filename, fi):
+    """Resolve a symbol-server binary URL from winbindex fileInfo.
+
+    Returns (url, virtual_size, method, candidate_urls) or None.
+    method is "virtualSize" or "delta_candidates".
+    """
+    timestamp = fi.get("timestamp")
+    if timestamp is None:
+        return None
+
+    virtual_size = fi.get("virtualSize")
+    if virtual_size is not None:
+        url = build_binary_url(filename, timestamp, virtual_size)
+        return url, virtual_size, "virtualSize", []
+
+    file_size = fi.get("size")
+    last_ptr = fi.get("lastSectionPointerToRawData")
+    last_va = fi.get("lastSectionVirtualAddress")
+    if file_size is None or last_ptr is None or last_va is None:
+        return None
+
+    sizes = delta_virtual_size_candidates(file_size, last_ptr, last_va)
+    candidate_urls = [build_binary_url(filename, timestamp, s) for s in sizes]
+    for size, url in zip(sizes, candidate_urls):
+        exists, _ = head_ok(url)
+        if exists:
+            return url, size, "delta_candidates", candidate_urls
+    return None
+
+
 def stream_download(url, dest_path, timeout=120):
     """Download `url` to `dest_path`. Returns (ok, size, status)."""
     r = session().get(url, stream=True, allow_redirects=True, timeout=timeout)
@@ -431,16 +495,22 @@ def process_entry(filename, sha256, slot, outdir, overwrite):
     """Download binary + PDB for one merged entry. Keep only if the PDB exists."""
     entry = slot["entry"]
     fi = entry.get("fileInfo") or {}
-    timestamp = fi.get("timestamp")
-    virtual_size = fi.get("virtualSize")
     version = fi.get("version") or "unknown"
     arch = machine_arch(fi.get("machineType"))
     srclabel = "+".join(sorted(slot["sources"]))
-
-    if timestamp is None or virtual_size is None:
-        return  # not enough info to build the symbol-server URL
-
     label = "%s [%s/%s] %s" % (version, arch, srclabel, sha256[:8])
+
+    # Enough metadata to attempt a symbol-server URL? (exact or delta candidates)
+    timestamp = fi.get("timestamp")
+    has_exact = timestamp is not None and fi.get("virtualSize") is not None
+    has_delta = (
+        timestamp is not None
+        and fi.get("size") is not None
+        and fi.get("lastSectionPointerToRawData") is not None
+        and fi.get("lastSectionVirtualAddress") is not None
+    )
+    if not has_exact and not has_delta:
+        return
 
     dir_name = "%s_%s_%s" % (sanitize(version), arch, sha256[:8])
     dest_dir = os.path.join(outdir, dir_name)
@@ -452,7 +522,15 @@ def process_entry(filename, sha256, slot, outdir, overwrite):
             COUNTERS.skipped += 1
         return
 
-    bin_url = build_binary_url(filename, timestamp, virtual_size)
+    resolved = resolve_binary_url(filename, fi)
+    if resolved is None:
+        COUNTERS.log("[-] no binary (delta candidates missed) %s" % label)
+        with COUNTERS.lock:
+            COUNTERS.no_binary += 1
+        return
+
+    bin_url, virtual_size, resolve_method, candidate_urls = resolved
+
     tmp_bin = None
     try:
         # 1) fetch the binary to a temp file first (needed to read the PDB signature)
@@ -476,7 +554,7 @@ def process_entry(filename, sha256, slot, outdir, overwrite):
 
         # 3) check whether the PDB exists on the symbol server
         pdb_url = MSDL % (pdbname, signature.upper(), pdbname)
-        exists, resolved = head_ok(pdb_url)
+        exists, resolved_pdb = head_ok(pdb_url)
         if not exists:
             COUNTERS.log("[-] no PDB %s (%s)" % (label, pdbname))
             with COUNTERS.lock:
@@ -489,7 +567,7 @@ def process_entry(filename, sha256, slot, outdir, overwrite):
         tmp_bin = None  # moved, don't clean up
 
         pdb_path = os.path.join(dest_dir, pdbname)
-        ok, psize, pstatus = stream_download(resolved, pdb_path)
+        ok, psize, pstatus = stream_download(resolved_pdb, pdb_path)
         if not ok:
             COUNTERS.log("[-] PDB vanished (HTTP %s) %s" % (pstatus, label))
             shutil.rmtree(dest_dir, ignore_errors=True)
@@ -505,6 +583,8 @@ def process_entry(filename, sha256, slot, outdir, overwrite):
             "machineType": fi.get("machineType"),
             "timestamp": timestamp,
             "virtualSize": virtual_size,
+            "binaryResolveMethod": resolve_method,
+            "binaryCandidateUrls": candidate_urls,
             "sources": sorted(slot["sources"]),
             "windowsVersions": sorted(slot["osversions"]),
             "binaryUrl": bin_url,
@@ -518,7 +598,8 @@ def process_entry(filename, sha256, slot, outdir, overwrite):
         with open(os.path.join(dest_dir, "metadata.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
-        COUNTERS.log("[+] kept %s -> %s" % (label, dir_name))
+        method_note = "" if resolve_method == "virtualSize" else " (delta)"
+        COUNTERS.log("[+] kept %s -> %s%s" % (label, dir_name, method_note))
         with COUNTERS.lock:
             COUNTERS.kept += 1
     except Exception as exc:
