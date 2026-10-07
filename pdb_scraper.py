@@ -12,6 +12,10 @@ A version is kept ONLY if its PDB exists: the binary and its PDB are stored
 together in a per-version directory. If the PDB cannot be found, both the
 binary and the (missing) PDB are discarded.
 
+With --binary-only the whole chain still runs -- including the PDB-existence
+check that discards versions without one -- but the PDB download itself is
+skipped, so only the executable is saved into the destination folder.
+
 Winbindex has three separate data roots (mirroring the site's ?arch= switch):
 
     x64/x86 : https://winbindex.m417z.com/data/by_filename_compressed/<name>.json.gz
@@ -315,13 +319,18 @@ def analyze_pdb(path):
     }
 
 
-def analyze_files(bin_path, pdb_path):
-    """Run PE + PDB analysis, never raising into the download pipeline."""
+def analyze_files(bin_path, pdb_path=None):
+    """Run PE + PDB analysis, never raising into the download pipeline.
+
+    `pdb_path` is None when the PDB was deliberately not downloaded
+    (--binary-only); the "pdb" slot is then null rather than an error."""
     try:
         exe = analyze_pe(bin_path)
     except Exception as exc:
         exe = {"functions": None, "types": None, "global_variables": None,
                "error": "%s: %s" % (type(exc).__name__, exc)}
+    if pdb_path is None:
+        return {"exe": exe, "pdb": None}
     try:
         pdb = analyze_pdb(pdb_path)
     except Exception as exc:
@@ -491,8 +500,11 @@ def head_ok(url, timeout=60):
     return (r.status_code == 200), r.url
 
 
-def process_entry(filename, sha256, slot, outdir, overwrite):
-    """Download binary + PDB for one merged entry. Keep only if the PDB exists."""
+def process_entry(filename, sha256, slot, outdir, overwrite, binary_only=False):
+    """Download binary + PDB for one merged entry. Keep only if the PDB exists.
+
+    With `binary_only`, the PDB is still located and checked for existence, but
+    only the executable is written to the destination folder."""
     entry = slot["entry"]
     fi = entry.get("fileInfo") or {}
     version = fi.get("version") or "unknown"
@@ -562,18 +574,21 @@ def process_entry(filename, sha256, slot, outdir, overwrite):
             return  # discard both binary and pdb
 
         # 4) PDB exists -> commit: create dir, move binary in, download PDB
+        #    (--binary-only stops here and keeps just the executable)
         os.makedirs(dest_dir, exist_ok=True)
         shutil.move(tmp_bin, bin_path)
         tmp_bin = None  # moved, don't clean up
 
-        pdb_path = os.path.join(dest_dir, pdbname)
-        ok, psize, pstatus = stream_download(resolved_pdb, pdb_path)
-        if not ok:
-            COUNTERS.log("[-] PDB vanished (HTTP %s) %s" % (pstatus, label))
-            shutil.rmtree(dest_dir, ignore_errors=True)
-            with COUNTERS.lock:
-                COUNTERS.no_pdb += 1
-            return
+        pdb_path = psize = None
+        if not binary_only:
+            pdb_path = os.path.join(dest_dir, pdbname)
+            ok, psize, pstatus = stream_download(resolved_pdb, pdb_path)
+            if not ok:
+                COUNTERS.log("[-] PDB vanished (HTTP %s) %s" % (pstatus, label))
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                with COUNTERS.lock:
+                    COUNTERS.no_pdb += 1
+                return
 
         meta = {
             "filename": filename,
@@ -599,6 +614,8 @@ def process_entry(filename, sha256, slot, outdir, overwrite):
             json.dump(meta, f, indent=2)
 
         method_note = "" if resolve_method == "virtualSize" else " (delta)"
+        if binary_only:
+            method_note += " [binary only]"
         COUNTERS.log("[+] kept %s -> %s%s" % (label, dir_name, method_note))
         with COUNTERS.lock:
             COUNTERS.kept += 1
@@ -660,11 +677,12 @@ def find_pe_files(input_dir, exts):
     return sorted(found)
 
 
-def process_local_file(path, outdir, overwrite, arch_filter):
+def process_local_file(path, outdir, overwrite, arch_filter, binary_only=False):
     """Look up + fetch the PDB for one local PE, organizing it like winbindex mode.
 
     The user's original file is COPIED (never moved); if no PDB exists nothing is
-    written and the original is left untouched."""
+    written and the original is left untouched. With `binary_only`, the PDB is
+    still located and checked for existence, but never downloaded."""
     filename = os.path.basename(path)
     try:
         machine, version = pe_identity(path)
@@ -713,18 +731,21 @@ def process_local_file(path, outdir, overwrite, arch_filter):
             return  # leave the user's original in place, write nothing
 
         # 3) PDB exists -> copy the binary in, download the PDB, analyze
+        #    (--binary-only stops here and keeps just the executable)
         os.makedirs(dest_dir, exist_ok=True)
         bin_path = os.path.join(dest_dir, filename)
         shutil.copy2(path, bin_path)  # copy, never move the source file
 
-        pdb_path = os.path.join(dest_dir, pdbname)
-        ok, psize, pstatus = stream_download(resolved, pdb_path)
-        if not ok:
-            COUNTERS.log("[-] PDB vanished (HTTP %s) %s" % (pstatus, label))
-            shutil.rmtree(dest_dir, ignore_errors=True)
-            with COUNTERS.lock:
-                COUNTERS.no_pdb += 1
-            return
+        pdb_path = psize = None
+        if not binary_only:
+            pdb_path = os.path.join(dest_dir, pdbname)
+            ok, psize, pstatus = stream_download(resolved, pdb_path)
+            if not ok:
+                COUNTERS.log("[-] PDB vanished (HTTP %s) %s" % (pstatus, label))
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                with COUNTERS.lock:
+                    COUNTERS.no_pdb += 1
+                return
 
         meta = {
             "filename": filename,
@@ -744,7 +765,8 @@ def process_local_file(path, outdir, overwrite, arch_filter):
         with open(os.path.join(dest_dir, "metadata.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
-        COUNTERS.log("[+] kept %s -> %s" % (label, dir_name))
+        COUNTERS.log("[+] kept %s -> %s%s"
+                     % (label, dir_name, " [binary only]" if binary_only else ""))
         with COUNTERS.lock:
             COUNTERS.kept += 1
     except Exception as exc:
@@ -780,12 +802,19 @@ def parse_args():
                    help="Number of concurrent download workers.")
     p.add_argument("--overwrite", action="store_true",
                    help="Re-download even if a version directory already exists.")
+    p.add_argument("--binary-only", action="store_true",
+                   help="Download only the binary, not the PDB. The whole chain "
+                        "still runs -- including the PDB-existence check, so "
+                        "versions without a PDB are still discarded -- but the "
+                        "PDB download is skipped and only the executable is "
+                        "saved into the destination folder.")
     return p.parse_args()
 
 
-def print_summary():
+def print_summary(binary_only=False):
     print("\n=== Summary ===")
-    print("  kept (binary+pdb) : %d" % COUNTERS.kept)
+    kept_label = "kept (binary only)" if binary_only else "kept (binary+pdb) "
+    print("  %s: %d" % (kept_label, COUNTERS.kept))
     print("  no PDB (discarded): %d" % COUNTERS.no_pdb)
     print("  no binary         : %d" % COUNTERS.no_binary)
     print("  skipped (existing): %d" % COUNTERS.skipped)
@@ -799,6 +828,8 @@ def run_winbindex(args, arch_filter):
     print("[>] Sources  : %s" % ", ".join(sources))
     print("[>] Arch     : %s" % (", ".join(sorted(arch_filter)) if arch_filter else "all"))
     print("[>] Output   : %s" % os.path.abspath(args.output_dir))
+    print("[>] PDB      : %s" % ("not downloaded (--binary-only)"
+                                 if args.binary_only else "downloaded"))
     print("[>] Threads  : %d\n" % args.threads)
 
     merged = gather_entries(args.filename, sources)
@@ -816,12 +847,13 @@ def run_winbindex(args, arch_filter):
     os.makedirs(args.output_dir, exist_ok=True)
     with ThreadPoolExecutor(max_workers=args.threads) as pool:
         futures = [
-            pool.submit(process_entry, args.filename, sha, slot, args.output_dir, args.overwrite)
+            pool.submit(process_entry, args.filename, sha, slot, args.output_dir,
+                        args.overwrite, args.binary_only)
             for sha, slot in merged.items()
         ]
         for _ in as_completed(futures):
             pass
-    print_summary()
+    print_summary(args.binary_only)
 
 
 def run_local(args, arch_filter):
@@ -833,6 +865,8 @@ def run_local(args, arch_filter):
     print("[>] Ext      : %s" % ", ".join(sorted(exts)))
     print("[>] Arch     : %s" % (", ".join(sorted(arch_filter)) if arch_filter else "all"))
     print("[>] Output   : %s" % os.path.abspath(args.output_dir))
+    print("[>] PDB      : %s" % ("not downloaded (--binary-only)"
+                                 if args.binary_only else "downloaded"))
     print("[>] Threads  : %d\n" % args.threads)
 
     if not os.path.isdir(input_dir):
@@ -848,12 +882,13 @@ def run_local(args, arch_filter):
     os.makedirs(args.output_dir, exist_ok=True)
     with ThreadPoolExecutor(max_workers=args.threads) as pool:
         futures = [
-            pool.submit(process_local_file, p, args.output_dir, args.overwrite, arch_filter)
+            pool.submit(process_local_file, p, args.output_dir, args.overwrite,
+                        arch_filter, args.binary_only)
             for p in files
         ]
         for _ in as_completed(futures):
             pass
-    print_summary()
+    print_summary(args.binary_only)
 
 
 def main():
